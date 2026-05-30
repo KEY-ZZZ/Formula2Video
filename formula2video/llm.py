@@ -1,124 +1,127 @@
-"""统一 LLM 接口层。
+"""Unified LLM interface layer.
 
-支持 Anthropic 和 OpenAI 两家, 运行时按配置切换。
-所有 Agent 通过 `complete_json()` 获取结构化输出, 内部做 JSON 解析与重试。
+Wraps the Anthropic and OpenAI SDKs behind one tiny interface, switching at
+runtime based on :data:`formula2video.config.config`. When no API key is
+available (or the SDK is not installed) the client transparently runs in
+*mock mode*, so the entire pipeline can run end-to-end offline.
 
-设计:
-- 无 API key 时进入 mock 模式, 返回占位数据, 便于离线跑通整条链路。
-- complete_json 强制要求模型输出 JSON, 并做容错解析 (剥离 ```json 围栏)。
+Provider SDK imports are deliberately performed *inside* methods (lazy) and
+guarded with try/except, so this module imports cleanly even when neither
+``anthropic`` nor ``openai`` is installed.
 """
-
 from __future__ import annotations
 
 import json
-import re
-from typing import Any
+from typing import Any, Optional
 
 from formula2video.config import config
 
 
 class LLMError(RuntimeError):
-    """LLM 调用失败。"""
+    """Raised when an LLM call fails or returns unusable output."""
 
 
-def _strip_code_fence(text: str) -> str:
-    """剥离 ```json ... ``` 或 ``` ... ``` 围栏, 返回纯 JSON 文本。"""
-    text = text.strip()
-    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
-    if fence:
-        return fence.group(1).strip()
-    return text
+def _strip_json_fences(text: str) -> str:
+    """Remove ```json ... ``` (or plain ``` ... ```) fences around a payload."""
+    s = text.strip()
+    if s.startswith("```"):
+        # Drop the opening fence line (``` or ```json).
+        first_newline = s.find("\n")
+        if first_newline != -1:
+            s = s[first_newline + 1:]
+        # Drop a trailing fence.
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3]
+    return s.strip()
 
 
 class LLMClient:
-    """对两家 provider 的薄封装。"""
+    """Provider-agnostic chat client.
 
-    def __init__(
-        self,
-        provider: str | None = None,
-        model: str | None = None,
-    ) -> None:
+    Parameters
+    ----------
+    provider:
+        ``"anthropic"`` or ``"openai"``. Defaults to ``config.llm_provider``.
+
+    The ``mock`` attribute is ``True`` when no usable API key is configured.
+    Tests can also force mock mode by setting ``client.mock = True``.
+    """
+
+    def __init__(self, provider: Optional[str] = None) -> None:
         self.provider = provider or config.llm_provider
-        self.model = model or config.llm_model
-        self._client: Any = None
-        self.mock = False
-        self._init_backend()
-
-    def _init_backend(self) -> None:
-        if self.provider == "anthropic":
-            if not config.anthropic_api_key:
-                self.mock = True
-                return
-            try:
-                import anthropic
-
-                self._client = anthropic.Anthropic(api_key=config.anthropic_api_key)
-            except ImportError as exc:  # pragma: no cover
-                raise LLMError("未安装 anthropic, 请 pip install anthropic") from exc
-        elif self.provider == "openai":
-            if not config.openai_api_key:
-                self.mock = True
-                return
-            try:
-                import openai
-
-                self._client = openai.OpenAI(api_key=config.openai_api_key)
-            except ImportError as exc:  # pragma: no cover
-                raise LLMError("未安装 openai, 请 pip install openai") from exc
-        else:
-            raise LLMError(f"未知 provider: {self.provider}")
+        # Enter mock mode automatically when no API key is configured.
+        self.mock: bool = not config.has_api_key
 
     # ------------------------------------------------------------------ #
-    def complete(self, system: str, user: str, max_tokens: int = 4096) -> str:
-        """返回纯文本补全。mock 模式下报错 (文本补全无通用占位)。"""
+    # Public API
+    # ------------------------------------------------------------------ #
+    def complete(self, system: str, user: str) -> str:
+        """Return the model's plain-text completion for a system+user prompt."""
         if self.mock:
-            raise LLMError(
-                "当前为 mock 模式 (无 API key)。complete() 需要真实 LLM; "
-                "结构化调用请用 complete_json 并传 mock_fallback。"
-            )
-        if self.provider == "anthropic":
-            resp = self._client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            return resp.content[0].text
-        # openai
-        resp = self._client.chat.completions.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        return resp.choices[0].message.content or ""
+            raise LLMError("LLMClient is in mock mode; no completion available.")
+        if self.provider == "openai":
+            return self._complete_openai(system, user)
+        return self._complete_anthropic(system, user)
 
     def complete_json(
         self,
         system: str,
         user: str,
         *,
-        mock_fallback: dict | list | None = None,
-        max_tokens: int = 4096,
+        mock_fallback: Any = None,
     ) -> Any:
-        """要求模型返回 JSON, 解析为 Python 对象。
+        """Ask the model for JSON and parse it.
 
-        mock 模式下直接返回 mock_fallback (若提供), 否则报错。
+        In mock mode (or on parse failure with a fallback provided) returns
+        ``mock_fallback``. Otherwise strips ```json fences and ``json.loads``.
         """
         if self.mock:
-            if mock_fallback is not None:
-                return mock_fallback
-            raise LLMError("mock 模式且未提供 mock_fallback")
-
-        raw = self.complete(
-            system + "\n\n严格只输出合法 JSON, 不要任何额外说明文字。",
-            user,
-            max_tokens=max_tokens,
-        )
-        cleaned = _strip_code_fence(raw)
+            return mock_fallback
+        raw = self.complete(system, user)
+        cleaned = _strip_json_fences(raw)
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            raise LLMError(f"模型输出不是合法 JSON:\n{raw[:500]}") from exc
+            if mock_fallback is not None:
+                return mock_fallback
+            raise LLMError(f"Model did not return valid JSON: {exc}\n{raw}") from exc
+
+    # ------------------------------------------------------------------ #
+    # Provider backends (lazy imports)
+    # ------------------------------------------------------------------ #
+    def _complete_anthropic(self, system: str, user: str) -> str:
+        try:
+            import anthropic  # noqa: WPS433 (lazy import is intentional)
+        except ImportError as exc:  # pragma: no cover - depends on env
+            raise LLMError("anthropic SDK is not installed.") from exc
+        try:
+            client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+            resp = client.messages.create(
+                model=config.anthropic_model,
+                max_tokens=4096,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            return "".join(
+                block.text for block in resp.content if getattr(block, "type", "") == "text"
+            )
+        except Exception as exc:  # pragma: no cover - network path
+            raise LLMError(f"Anthropic call failed: {exc}") from exc
+
+    def _complete_openai(self, system: str, user: str) -> str:
+        try:
+            import openai  # noqa: WPS433
+        except ImportError as exc:  # pragma: no cover
+            raise LLMError("openai SDK is not installed.") from exc
+        try:
+            client = openai.OpenAI(api_key=config.openai_api_key)
+            resp = client.chat.completions.create(
+                model=config.openai_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as exc:  # pragma: no cover
+            raise LLMError(f"OpenAI call failed: {exc}") from exc
