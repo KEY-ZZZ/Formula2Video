@@ -1,27 +1,32 @@
-"""WP10 — Assembly Agent (M1 版: 仅拼接)。
+"""Assembly Agent (WP10) - concatenate rendered clips into the final video.
 
-M1 阶段只把各 manim 场景视频按顺序拼接成最终视频。
-后续里程碑会扩展为分层合成 (PixVerse 底层 + Manim 中层 + 旁白/音乐音轨 + 字幕)。
+M1 only stitches the Manim clips together (no audio/PixVerse layering yet).
+Uses the ffmpeg concat demuxer. Returns ``None`` when ffmpeg is missing,
+when there is nothing to stitch, or when concatenation fails.
 """
-
 from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Dict, List, Optional
 
 from formula2video.config import config
 from formula2video.schemas.contracts import SceneSpec
 
 
-def concat_videos(clips: list[Path], output_path: Path) -> Path | None:
-    """用 ffmpeg concat demuxer 拼接视频片段。失败返回 None。"""
+def concat_videos(clips: List[Path], output_path: Path) -> Optional[Path]:
+    """Concatenate ``clips`` (in order) into ``output_path`` via ffmpeg."""
+    clips = [Path(c) for c in clips if c is not None]
     if not clips:
         return None
+    output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
     list_file = output_path.parent / "concat_list.txt"
     list_file.write_text(
-        "\n".join(f"file '{c.resolve()}'" for c in clips), encoding="utf-8"
+        "".join(f"file '{c.resolve()}'\n" for c in clips), encoding="utf-8"
     )
+
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
@@ -30,22 +35,28 @@ def concat_videos(clips: list[Path], output_path: Path) -> Path | None:
         str(output_path),
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (FileNotFoundError, subprocess.SubprocessError):
         return None
-    return output_path if output_path.exists() else None
+    if proc.returncode != 0 or not output_path.exists():
+        return None
+    return output_path
 
 
 def run(
-    spec: SceneSpec,
-    rendered: dict[str, Path | None],
-    output_path: Path | None = None,
-) -> Path | None:
-    """按 scene 顺序拼接已渲染的片段。"""
-    output_path = output_path or (config.output_dir / "final.mp4")
-    clips = [
-        rendered[beat.scene_id]
-        for beat in spec.scenes
-        if rendered.get(beat.scene_id) is not None
-    ]
-    return concat_videos([c for c in clips if c is not None], output_path)
+    scene_spec: SceneSpec,
+    rendered: Dict[str, Optional[Path]],
+    output_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """Stitch rendered manim clips, ordered by the scene spec timeline."""
+    if output_path is None:
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = config.output_dir / "final.mp4"
+
+    ordered: List[Path] = []
+    for beat in scene_spec.beats:
+        clip = rendered.get(beat.scene_id)
+        if clip is not None:
+            ordered.append(Path(clip))
+
+    return concat_videos(ordered, Path(output_path))

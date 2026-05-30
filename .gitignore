@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Formula2Video runtime artifacts
+.f2v_work/
+output/
+media/
+*.mov
+*.mp4
+*.wav

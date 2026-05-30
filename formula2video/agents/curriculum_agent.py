@@ -1,49 +1,38 @@
-"""WP2 — Prerequisite + Curriculum Agent。
-
-构建最小知识依赖并排序。严格遵守极简即时原则: 前置概念 <= 3 个, 每个一句话。
-"""
-
+"""Curriculum Agent (WP2) - build a minimal just-in-time teaching plan."""
 from __future__ import annotations
+
+from typing import Optional
 
 from formula2video.llm import LLMClient
 from formula2video.schemas.contracts import Curriculum, InlinePrerequisite, Intent
 
-SYSTEM = """你负责规划数学讲解视频的教学路径, 严格遵守"极简即时原则":
-- 只识别理解本公式绝对必需的前置概念, 通常 <= 3 个。
-- 每个前置概念只用一句话内联解释, 禁止展开成章节。
-- 观众大概率已知的概念直接省略。
-
-输出 JSON:
-{
-  "core_concept": "用一句话概括公式的核心含义",
-  "inline_prerequisites": [{"concept": "概念名", "one_liner": "一句话解释"}],
-  "teaching_order": ["步骤1", "步骤2", ...]
-}
-只输出 JSON。"""
+_SYSTEM = (
+    "你是课程设计助手，遵守极简即时原则：只识别理解本公式绝对必需的前置概念"
+    "（通常 <= 3 个），每个前置概念只用一句话内联解释，禁止生成独立的前置章节。"
+    "如果某概念观众大概率已知，直接跳过。"
+    "输出 JSON：core_concept(str), inline_prerequisites([{concept, one_liner}]), "
+    "teaching_order([str])。只输出 JSON。"
+)
 
 
-def run(intent: Intent, llm: LLMClient | None = None) -> Curriculum:
-    """生成教学路径。"""
+def run(intent: Intent, llm: Optional[LLMClient] = None) -> Curriculum:
+    """Produce a :class:`Curriculum` from an :class:`Intent`."""
     llm = llm or LLMClient()
-
-    user = (
-        f"公式: {intent.formula_latex}\n"
-        f"主题: {intent.topic}\n"
-        f"教学目标: {intent.learning_goal}\n"
-        f"受众: {intent.audience_level}"
-    )
-
-    mock = {
-        "core_concept": f"(mock) {intent.topic} 的核心思想",
+    fallback = {
+        "core_concept": intent.topic or f"理解 {intent.formula_latex}",
         "inline_prerequisites": [],
-        "teaching_order": ["引入直觉", "展示公式", "几何解释", "总结洞见"],
+        "teaching_order": ["引入类比", "展示公式", "几何直觉", "总结"],
     }
-
-    data = llm.complete_json(SYSTEM, user, mock_fallback=mock)
+    user = (
+        f"公式: {intent.formula_latex}\n主题: {intent.topic}\n"
+        f"受众: {intent.audience_level}\n目标: {intent.learning_goal}"
+    )
+    data = llm.complete_json(_SYSTEM, user, mock_fallback=fallback)
+    prereqs = [InlinePrerequisite(**p) for p in data.get("inline_prerequisites", [])]
+    # Enforce the minimal principle: at most 3 inline prerequisites.
+    prereqs = prereqs[:3]
     return Curriculum(
-        core_concept=data["core_concept"],
-        inline_prerequisites=[
-            InlinePrerequisite(**p) for p in data.get("inline_prerequisites", [])
-        ],
-        teaching_order=data["teaching_order"],
+        core_concept=data.get("core_concept", fallback["core_concept"]),
+        inline_prerequisites=prereqs,
+        teaching_order=data.get("teaching_order") or fallback["teaching_order"],
     )
